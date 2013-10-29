@@ -953,8 +953,8 @@ static ssize_t f2fs_direct_IO(int rw, struct kiocb *iocb,
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_mapping->host;
-	return blockdev_direct_IO(rw, iocb, inode, iov, offset, nr_segs,
-							get_data_block);
+	return blockdev_direct_IO(rw, iocb, inode, inode->i_sb->s_bdev, iov,
+					offset, nr_segs, get_data_block, NULL);
 }
 
 static void f2fs_invalidate_data_page(struct page *page, unsigned long offset)
