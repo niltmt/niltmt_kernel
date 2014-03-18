@@ -74,6 +74,7 @@ static match_table_t f2fs_tokens = {
 enum {
 	GC_THREAD,	/* struct f2fs_gc_thread */
 	SM_INFO,	/* struct f2fs_sm_info */
+	F2FS_SBI,	/* struct f2fs_sb_info */
 };
 
 struct f2fs_attr {
@@ -91,6 +92,8 @@ static unsigned char *__struct_ptr(struct f2fs_sb_info *sbi, int struct_type)
 		return (unsigned char *)sbi->gc_thread;
 	else if (struct_type == SM_INFO)
 		return (unsigned char *)SM_I(sbi);
+	else if (struct_type == F2FS_SBI)
+		return (unsigned char *)sbi;
 	return NULL;
 }
 
@@ -180,6 +183,8 @@ F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, reclaim_segments, rec_prefree_segments);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, max_small_discards, max_discards);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, ipu_policy, ipu_policy);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, min_ipu_util, min_ipu_util);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, max_victim_search, max_victim_search);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, dir_level, dir_level);
 
 #define ATTR_LIST(name) (&f2fs_attr_##name.attr)
 static struct attribute *f2fs_attrs[] = {
@@ -191,6 +196,8 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(max_small_discards),
 	ATTR_LIST(ipu_policy),
 	ATTR_LIST(min_ipu_util),
+	ATTR_LIST(max_victim_search),
+	ATTR_LIST(dir_level),
 	NULL,
 };
 
@@ -353,6 +360,9 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 
 	if (test_opt(F2FS_SB(sb), INLINE_XATTR))
 		set_inode_flag(fi, FI_INLINE_XATTR);
+
+	/* Will be used by directory only */
+	fi->i_dir_level = F2FS_SB(sb)->dir_level;
 
 	return &fi->vfs_inode;
 }
@@ -530,16 +540,18 @@ static int segment_info_seq_show(struct seq_file *seq, void *offset)
 {
 	struct super_block *sb = seq->private;
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
-	unsigned int total_segs = le32_to_cpu(sbi->raw_super->segment_count_main);
+	unsigned int total_segs =
+			le32_to_cpu(sbi->raw_super->segment_count_main);
 	int i;
 
 	for (i = 0; i < total_segs; i++) {
 		seq_printf(seq, "%u", get_valid_blocks(sbi, i, 1));
-		if (i != 0 && (i % 10) == 0)
-			seq_puts(seq, "\n");
+		if ((i % 10) == 9 || i == (total_segs - 1))
+			seq_putc(seq, '\n');
 		else
-			seq_puts(seq, " ");
+			seq_putc(seq, ' ');
 	}
+
 	return 0;
 }
 
@@ -631,6 +643,8 @@ static struct inode *f2fs_nfs_get_inode(struct super_block *sb,
 	struct inode *inode;
 
 	if (unlikely(ino < F2FS_ROOT_INO(sbi)))
+		return ERR_PTR(-ESTALE);
+	if (unlikely(ino >= NM_I(sbi)->max_nid))
 		return ERR_PTR(-ESTALE);
 
 	/*
@@ -775,9 +789,12 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 	sbi->node_ino_num = le32_to_cpu(raw_super->node_ino);
 	sbi->meta_ino_num = le32_to_cpu(raw_super->meta_ino);
 	sbi->cur_victim_sec = NULL_SECNO;
+	sbi->max_victim_search = DEF_MAX_VICTIM_SEARCH;
 
 	for (i = 0; i < NR_COUNT_TYPE; i++)
 		atomic_set(&sbi->nr_pages[i], 0);
+
+	sbi->dir_level = DEF_DIR_LEVEL;
 }
 
 /*
@@ -810,8 +827,9 @@ retry:
 	/* sanity checking of raw super */
 	if (sanity_check_raw_super(sb, *raw_super)) {
 		brelse(*raw_super_buf);
-		f2fs_msg(sb, KERN_ERR, "Can't find a valid F2FS filesystem "
-				"in %dth superblock", block + 1);
+		f2fs_msg(sb, KERN_ERR,
+			"Can't find valid F2FS filesystem in %dth superblock",
+								block + 1);
 		if (block == 0) {
 			block++;
 			goto retry;
@@ -980,28 +998,9 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 		goto free_root_inode;
 	}
 
-	/* recover fsynced data */
-	if (!test_opt(sbi, DISABLE_ROLL_FORWARD)) {
-		err = recover_fsync_data(sbi);
-		if (err)
-			f2fs_msg(sb, KERN_ERR,
-				"Cannot recover all fsync data errno=%ld", err);
-	}
-
-	/*
-	 * If filesystem is not mounted as read-only then
-	 * do start the gc_thread.
-	 */
-	if (!(sb->s_flags & MS_RDONLY)) {
-		/* After POR, we can run background GC thread.*/
-		err = start_gc_thread(sbi);
-		if (err)
-			goto free_gc;
-	}
-
 	err = f2fs_build_stats(sbi);
 	if (err)
-		goto free_gc;
+		goto free_root_inode;
 
 	if (f2fs_proc_root)
 		sbi->s_proc = proc_mkdir(sb->s_id, f2fs_proc_root);
@@ -1023,17 +1022,36 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 	err = kobject_init_and_add(&sbi->s_kobj, &f2fs_ktype, NULL,
 							"%s", sb->s_id);
 	if (err)
-		goto fail;
+		goto free_proc;
 
+	/* recover fsynced data */
+	if (!test_opt(sbi, DISABLE_ROLL_FORWARD)) {
+		err = recover_fsync_data(sbi);
+		if (err)
+			f2fs_msg(sb, KERN_ERR,
+				"Cannot recover all fsync data errno=%ld", err);
+	}
+
+	/*
+	 * If filesystem is not mounted as read-only then
+	 * do start the gc_thread.
+	 */
+	if (!(sb->s_flags & MS_RDONLY)) {
+		/* After POR, we can run background GC thread.*/
+		err = start_gc_thread(sbi);
+		if (err)
+			goto free_kobj;
+	}
 	return 0;
-fail:
+
+free_kobj:
+	kobject_del(&sbi->s_kobj);
+free_proc:
 	if (sbi->s_proc) {
 		remove_proc_entry("segment_info", sbi->s_proc);
 		remove_proc_entry(sb->s_id, f2fs_proc_root);
 	}
 	f2fs_destroy_stats(sbi);
-free_gc:
-	stop_gc_thread(sbi);
 free_root_inode:
 	iput(root);
 free_node_inode:
@@ -1072,7 +1090,7 @@ MODULE_ALIAS_FS("f2fs");
 static int __init init_inodecache(void)
 {
 	f2fs_inode_cachep = f2fs_kmem_cache_create("f2fs_inode_cache",
-			sizeof(struct f2fs_inode_info), NULL);
+			sizeof(struct f2fs_inode_info));
 	if (!f2fs_inode_cachep)
 		return -ENOMEM;
 	return 0;

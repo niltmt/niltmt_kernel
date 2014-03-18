@@ -26,51 +26,45 @@
 
 static void f2fs_read_end_io(struct bio *bio, int err)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+	struct bio_vec *bvec;
+	int i;
 
-	do {
+	__bio_for_each_segment(bvec, bio, i, 0) {
 		struct page *page = bvec->bv_page;
 
-		if (--bvec >= bio->bi_io_vec)
-			prefetchw(&bvec->bv_page->flags);
-
-		if (unlikely(!uptodate)) {
+		if (!err) {
+			SetPageUptodate(page);
+		} else {
 			ClearPageUptodate(page);
 			SetPageError(page);
-		} else {
-			SetPageUptodate(page);
 		}
 		unlock_page(page);
-	} while (bvec >= bio->bi_io_vec);
-
+	}
 	bio_put(bio);
 }
 
 static void f2fs_write_end_io(struct bio *bio, int err)
 {
-	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
-	struct f2fs_sb_info *sbi = F2FS_SB(bvec->bv_page->mapping->host->i_sb);
+	struct f2fs_sb_info *sbi = bio->bi_private;
+	struct bio_vec *bvec;
+	int i;
 
-	do {
+	__bio_for_each_segment(bvec, bio, i, 0) {
 		struct page *page = bvec->bv_page;
 
-		if (--bvec >= bio->bi_io_vec)
-			prefetchw(&bvec->bv_page->flags);
-
-		if (unlikely(!uptodate)) {
+		if (unlikely(err)) {
 			SetPageError(page);
 			set_bit(AS_EIO, &page->mapping->flags);
-			set_ckpt_flags(sbi->ckpt, CP_ERROR_FLAG);
-			sbi->sb->s_flags |= MS_RDONLY;
+			f2fs_stop_checkpoint(sbi);
 		}
 		end_page_writeback(page);
 		dec_page_count(sbi, F2FS_WRITEBACK);
-	} while (bvec >= bio->bi_io_vec);
+	}
 
-	if (bio->bi_private)
-		complete(bio->bi_private);
+	if (sbi->wait_io) {
+		complete(sbi->wait_io);
+		sbi->wait_io = NULL;
+	}
 
 	if (!get_pages(sbi, F2FS_WRITEBACK) &&
 			!list_empty(&sbi->cp_wait.task_list))
@@ -93,6 +87,7 @@ static struct bio *__bio_alloc(struct f2fs_sb_info *sbi, block_t blk_addr,
 	bio->bi_bdev = sbi->sb->s_bdev;
 	bio->bi_sector = SECTOR_FROM_BLOCK(sbi, blk_addr);
 	bio->bi_end_io = is_read ? f2fs_read_end_io : f2fs_write_end_io;
+	bio->bi_private = sbi;
 
 	return bio;
 }
@@ -120,7 +115,7 @@ static void __submit_merged_bio(struct f2fs_bio_info *io)
 		 */
 		if (fio->type == META_FLUSH) {
 			DECLARE_COMPLETION_ONSTACK(wait);
-			io->bio->bi_private = &wait;
+			io->sbi->wait_io = &wait;
 			submit_bio(rw, io->bio);
 			wait_for_completion(&wait);
 		} else {
@@ -144,7 +139,7 @@ void f2fs_submit_merged_bio(struct f2fs_sb_info *sbi,
 	/* change META to META_FLUSH in the checkpoint procedure */
 	if (type >= META_FLUSH) {
 		io->fio.type = META_FLUSH;
-		io->fio.rw = WRITE_FLUSH_FUA;
+		io->fio.rw = WRITE_FLUSH_FUA | REQ_META | REQ_PRIO;
 	}
 	__submit_merged_bio(io);
 	mutex_unlock(&io->io_mutex);
@@ -226,7 +221,7 @@ static void __set_data_blkaddr(struct dnode_of_data *dn, block_t new_addr)
 	struct page *node_page = dn->node_page;
 	unsigned int ofs_in_node = dn->ofs_in_node;
 
-	f2fs_wait_on_page_writeback(node_page, NODE, false);
+	f2fs_wait_on_page_writeback(node_page, NODE);
 
 	rn = F2FS_NODE(node_page);
 
@@ -249,6 +244,7 @@ int reserve_new_block(struct dnode_of_data *dn)
 
 	__set_data_blkaddr(dn, NEW_ADDR);
 	dn->data_blkaddr = NEW_ADDR;
+	mark_inode_dirty(dn->inode);
 	sync_inode_page(dn);
 	return 0;
 }
@@ -564,7 +560,6 @@ repeat:
 		i_size_write(inode, ((index + 1) << PAGE_CACHE_SHIFT));
 		/* Only the directory inode sets new_i_size */
 		set_inode_flag(F2FS_I(inode), FI_UPDATE_DIR);
-		mark_inode_dirty_sync(inode);
 	}
 	return page;
 
@@ -792,7 +787,7 @@ static int f2fs_write_data_page(struct page *page,
 	int err = 0;
 	struct f2fs_io_info fio = {
 		.type = DATA,
-		.rw = (wbc->sync_mode == WB_SYNC_ALL) ? WRITE_SYNC: WRITE,
+		.rw = (wbc->sync_mode == WB_SYNC_ALL) ? WRITE_SYNC : WRITE,
 	};
 
 	if (page->index < end_index)
@@ -804,46 +799,36 @@ static int f2fs_write_data_page(struct page *page,
 	 */
 	offset = i_size & (PAGE_CACHE_SIZE - 1);
 	if ((page->index >= end_index + 1) || !offset) {
-		if (S_ISDIR(inode->i_mode)) {
-			dec_page_count(sbi, F2FS_DIRTY_DENTS);
-			inode_dec_dirty_dents(inode);
-		}
+		inode_dec_dirty_dents(inode);
 		goto out;
 	}
 
 	zero_user_segment(page, offset, PAGE_CACHE_SIZE);
 write:
-	if (unlikely(sbi->por_doing)) {
-		err = AOP_WRITEPAGE_ACTIVATE;
+	if (unlikely(sbi->por_doing))
 		goto redirty_out;
-	}
 
 	/* Dentry blocks are controlled by checkpoint */
 	if (S_ISDIR(inode->i_mode)) {
-		dec_page_count(sbi, F2FS_DIRTY_DENTS);
 		inode_dec_dirty_dents(inode);
 		err = do_write_data_page(page, &fio);
-	} else {
-		f2fs_lock_op(sbi);
-
-		if (f2fs_has_inline_data(inode) || f2fs_may_inline(inode)) {
-			err = f2fs_write_inline_data(inode, page, offset);
-			f2fs_unlock_op(sbi);
-			goto out;
-		} else {
-			err = do_write_data_page(page, &fio);
-		}
-
-		f2fs_unlock_op(sbi);
-		need_balance_fs = true;
+		goto done;
 	}
-	if (err == -ENOENT)
-		goto out;
-	else if (err)
+
+	if (!wbc->for_reclaim)
+		need_balance_fs = true;
+	else if (has_not_enough_free_secs(sbi, 0))
 		goto redirty_out;
 
-	if (wbc->for_reclaim)
-		f2fs_submit_merged_bio(sbi, DATA, WRITE);
+	f2fs_lock_op(sbi);
+	if (f2fs_has_inline_data(inode) || f2fs_may_inline(inode))
+		err = f2fs_write_inline_data(inode, page, offset);
+	else
+		err = do_write_data_page(page, &fio);
+	f2fs_unlock_op(sbi);
+done:
+	if (err && err != -ENOENT)
+		goto redirty_out;
 
 	clear_cold_data(page);
 out:
@@ -855,7 +840,7 @@ out:
 redirty_out:
 	wbc->pages_skipped++;
 	set_page_dirty(page);
-	return err;
+	return AOP_WRITEPAGE_ACTIVATE;
 }
 
 #define MAX_DESIRED_PAGES_WP	4096
@@ -1035,11 +1020,8 @@ static ssize_t f2fs_direct_IO(int rw, struct kiocb *iocb,
 static void f2fs_invalidate_data_page(struct page *page, unsigned long offset)
 {
 	struct inode *inode = page->mapping->host;
-	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
-	if (S_ISDIR(inode->i_mode) && PageDirty(page)) {
-		dec_page_count(sbi, F2FS_DIRTY_DENTS);
+	if (PageDirty(page))
 		inode_dec_dirty_dents(inode);
-	}
 	ClearPagePrivate(page);
 }
 
@@ -1057,6 +1039,8 @@ static int f2fs_set_data_page_dirty(struct page *page)
 	trace_f2fs_set_page_dirty(page, DATA);
 
 	SetPageUptodate(page);
+	mark_inode_dirty(inode);
+
 	if (!PageDirty(page)) {
 		__set_page_dirty_nobuffers(page);
 		set_dirty_dir_page(inode, page);
