@@ -47,6 +47,12 @@
 unsigned int touch_state_val = 0;
 EXPORT_SYMBOL(touch_state_val);
 
+int touch_is_pressed;
+static bool knockon_reset = false;
+#ifdef CONFIG_TOUCH_WAKE
+static bool mxt224_suspended = false;
+#endif
+
 struct object_t {
 	u8 object_type;
 	u16 i2c_address;
@@ -264,6 +270,7 @@ static int __devinit mxt224_init_touch_driver(struct mxt224_data *data)
 	}
 
 	data->objects = object_table;
+	touch_is_pressed = 0;
 
 	/* Verify CRC */
 	crc_address = OBJECT_TABLE_START_ADDRESS +
@@ -330,9 +337,23 @@ static void report_input_data(struct mxt224_data *data)
 		input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, i);
 		input_mt_sync(data->input_dev);
 		num_fingers_down++;
+		touch_is_pressed++;
 #ifdef CONFIG_TOUCH_WAKE
 	}
-	touch_press();
+		if (mxt224_suspended) {
+			if (knockon) {
+				if (touch_is_pressed == 0) {
+					if (knockon_reset) {
+						knockon_reset = false;
+						touch_press();
+					} else {
+						knockon_reset = true;
+					}
+				}
+			} else {
+				touch_press();
+			}
+		}
 #endif
 	}
 	data->finger_mask = 0;
@@ -444,6 +465,8 @@ static void mxt224_early_suspend(struct early_suspend *h)
 								early_suspend);
 	disable_irq(data->client->irq);
 	mxt224_internal_suspend(data);
+#else
+	mxt224_suspended = true;
 #endif
 }
 
@@ -454,6 +477,8 @@ static void mxt224_late_resume(struct early_suspend *h)
 								early_suspend);
 	mxt224_internal_resume(data);
 	enable_irq(data->client->irq);
+#else
+	mxt224_suspended = false;
 #endif
 }
 
@@ -602,6 +627,7 @@ static int __devinit mxt224_probe(struct i2c_client *client,
 		goto err_reset;
 
 	msleep(60);
+	touch_is_pressed = 0;
 
 	for (i = 0; i < data->num_fingers; i++)
 		data->fingers[i].z = -1;
